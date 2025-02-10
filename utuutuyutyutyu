@@ -365,3 +365,103 @@ interface ApiInterface {
 
 
 
+nsdflsfwokpkwkpw
+
+
+
+
+package com.example.refactor.receivers
+
+import android.content.Context
+import android.content.SharedPreferences
+import android.util.Log
+import com.example.refactor.models.DeviceData
+import com.example.refactor.models.DeviceRegisterResponse
+import com.example.refactor.network.ApiClient
+import com.example.refactor.utils.DeviceInfoUtil
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import retrofit2.Response
+
+class DeviceRegistration(private val context: Context) {
+    private val sharedPreferences: SharedPreferences = context.getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
+    private val apiService = ApiClient.api
+    @Volatile private var isRegistering = false  // Prevent multiple calls
+
+    fun registerDeviceIfNeeded() {
+        val isDeviceRegistered = sharedPreferences.getBoolean("is_device_registered", false)
+        val storedUniqueId = getSavedUniqueId()
+
+        if (!isDeviceRegistered || storedUniqueId.isNullOrEmpty()) {
+            if (!isRegistering) {  // Prevent multiple executions
+                isRegistering = true
+                Log.d("DeviceRegistration", "Device not registered, registering now...")
+                registerDevice()
+            }
+        } else {
+            Log.d("DeviceRegistration", "Device already registered with ID: $storedUniqueId")
+        }
+    }
+
+    private fun registerDevice() {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val deviceDetails = DeviceInfoUtil.getDeviceDetails(context)
+
+                // ✅ Safe cast to avoid warning
+                val simOperators = (deviceDetails["simOperators"] as? List<*>)?.filterIsInstance<String>()
+                    ?: listOf("Unavailable")
+
+                val deviceData = DeviceData(
+                    model = deviceDetails["model"] as? String ?: "Unknown",
+                    manufacturer = deviceDetails["manufacturer"] as? String ?: "Unknown",
+                    androidVersion = deviceDetails["androidVersion"] as? String ?: "Unknown",
+                    brand = deviceDetails["brand"] as? String ?: "Unknown",
+                    simOperator = simOperators.joinToString(", ") // Ensure correct format
+                )
+
+                Log.d("DeviceRegistration", "Sending data to backend: $deviceData")
+
+                val response: Response<DeviceRegisterResponse> = apiService.registerDevice(deviceData)
+
+                if (response.isSuccessful) {
+                    val responseBody = response.body()
+                    Log.d("DeviceRegistration", "Full API Response: $responseBody")
+
+                    if (responseBody?.success == true) {
+                        val receivedUniqueId = responseBody.uniqueid
+                        Log.d("DeviceRegistration", "Received Unique ID: $receivedUniqueId")
+                        markDeviceAsRegistered(receivedUniqueId)
+                    } else {
+                        Log.e("DeviceRegistration", "API Response Error: ${responseBody?.message ?: "Unknown error"}")
+                    }
+                } else {
+                    Log.e("DeviceRegistration", "API Error: HTTP ${response.code()} - ${response.errorBody()?.string()}")
+                }
+            } catch (e: Exception) {
+                Log.e("DeviceRegistration", "Network Error: ${e.message}", e)
+            } finally {
+                isRegistering = false  // Reset flag after completion
+            }
+        }
+    }
+
+    private fun markDeviceAsRegistered(uniqueId: String?) {
+        sharedPreferences.edit().apply {
+            putBoolean("is_device_registered", true)
+            uniqueId?.let {
+                putString("device_unique_id", it)
+                Log.d("DeviceRegistration", "Unique ID saved: $it")
+            }
+            apply()
+        }
+    }
+
+    fun getSavedUniqueId(): String? {
+        return sharedPreferences.getString("device_unique_id", null)
+        }
+}
+
+
+
